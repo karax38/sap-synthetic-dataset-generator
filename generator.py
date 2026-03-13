@@ -27,7 +27,8 @@ Z_VALUES = {"A": 2.05, "B": 1.65, "C": 1.28}
 MOVEMENT_TYPES = np.array([201, 261, 281, 601, 641, 643, 645])
 MOVEMENT_SIGNS = np.array(["S", "H"])
 UOM_CONFIG = {
-    "EA": {"decan": 0},
+    "ST": {"decan": 0},
+    "PC": {"decan": 0},
     "KG": {"decan": 3},
     "L": {"decan": 3},
 }
@@ -223,7 +224,7 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
         for material_idx in range(materials_per_plant):
             matnr = generate_material_id(plant_idx, material_idx)
             mtart = str(rng.choice(["ROH", "HALB", "FERT"], p=[0.45, 0.25, 0.30]))
-            meins = str(rng.choice(list(UOM_CONFIG.keys()), p=[0.60, 0.25, 0.15]))
+            meins = str(rng.choice(list(UOM_CONFIG.keys()), p=[0.45, 0.30, 0.15, 0.10]))
             decan = UOM_CONFIG[meins]["decan"]
             abc_class = weighted_choice(rng, ABC_DISTRIBUTION)
             demand_pattern = weighted_choice(rng, DEMAND_PATTERNS)
