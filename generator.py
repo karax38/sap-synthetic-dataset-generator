@@ -112,6 +112,7 @@ class MaterialRecord:
     lead_time_days: int
     goods_receipt_days: int
     purchasing_processing_days: int
+    wzeit_days: int | None
     safety_stock: float | None
     price_control: str
     standard_price: float
@@ -230,7 +231,7 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
             demand_pattern = weighted_choice(rng, DEMAND_PATTERNS)
             lead_time_days = int(rng.integers(5, 61))
             goods_receipt_days = int(rng.integers(1, 8))
-            purchasing_processing_days = int(rng.integers(1, 11))
+            purchasing_processing_days = 0
             price_control = weighted_choice(rng, PRICE_CONTROL_DISTRIBUTION)
             base_price = generate_price(rng)
             standard_price = base_price if price_control == "S" else round(base_price * rng.uniform(0.95, 1.15), 2)
@@ -266,6 +267,9 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
                     issued_quantities.append(float(quantity))
 
             safety_stock = calculate_safety_stock(issued_quantities, lead_time_days, abc_class, decan)
+            wzeit_days = None
+            if rng.random() < 0.30:
+                wzeit_days = int(round(lead_time_days + (5.0 / 7.0) * (purchasing_processing_days + goods_receipt_days)))
             materials.append(
                 MaterialRecord(
                     matnr=matnr,
@@ -277,6 +281,7 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
                     lead_time_days=lead_time_days,
                     goods_receipt_days=goods_receipt_days,
                     purchasing_processing_days=purchasing_processing_days,
+                    wzeit_days=wzeit_days,
                     safety_stock=safety_stock,
                     price_control=price_control,
                     standard_price=standard_price,
@@ -390,13 +395,23 @@ def build_tables(rng: np.random.Generator, materials: list[MaterialRecord], plan
         {"DISMM": "PD", "DISVF": "Y"},
         {"DISMM": "VB", "DISVF": "Y"},
     ])
-    v399 = pd.DataFrame([
-        {
-            "WERKS": werks,
-            "BZTEK": int(np.median([m.purchasing_processing_days for m in materials if m.werks == werks])) if any(m.werks == werks for m in materials) else 5,
-        }
-        for werks in plants
-    ])
+    if len(plants) <= 1:
+        bztek_map = {plants[0]: 0} if plants else {}
+    else:
+        bztek_map = {plants[0]: 0}
+        non_zero_assigned = False
+        for werks in plants[1:]:
+            value = int(rng.integers(0, 3))
+            if value > 0:
+                non_zero_assigned = True
+            bztek_map[werks] = value
+        if not non_zero_assigned and len(plants) > 1:
+            chosen_plant = str(rng.choice(plants[1:]))
+            bztek_map[chosen_plant] = int(rng.integers(1, 3))
+
+    v399 = pd.DataFrame(
+        [{"WERKS": werks, "BZTEK": bztek_map.get(werks, 0)} for werks in plants]
+    )
     mara = pd.DataFrame([
         {"MATNR": material.matnr, "MTART": material.mtart, "LVORM": material.deletion_flag, "MEINS": material.meins}
         for material in materials
@@ -405,7 +420,6 @@ def build_tables(rng: np.random.Generator, materials: list[MaterialRecord], plan
     marc_rows = []
     for idx, material in enumerate(materials):
         maabc = material.abc_class if abc_visibility_mask[idx] else ""
-        wzeit = round(float(material.lead_time_days + (5.0 / 7.0) * (material.purchasing_processing_days + material.goods_receipt_days)), 2)
         marc_rows.append(
             {
                 "MATNR": material.matnr,
@@ -417,7 +431,7 @@ def build_tables(rng: np.random.Generator, materials: list[MaterialRecord], plan
                 "WEBAZ": material.goods_receipt_days,
                 "PSTAT": "DEL",
                 "MAABC": maabc,
-                "WZEIT": wzeit,
+                "WZEIT": material.wzeit_days,
             }
         )
     marc = pd.DataFrame(marc_rows)
