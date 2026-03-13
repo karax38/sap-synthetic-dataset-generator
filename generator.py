@@ -291,8 +291,57 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
     if matdoc_df.empty:
         matdoc_df = pd.DataFrame(columns=[tech for _, tech in TEMPLATE_STRUCTURE["MATDOC"]])
     else:
+        matdoc_df = append_storno_rows(rng, matdoc_df, material_doc_number)
         matdoc_df = matdoc_df.sort_values(["WERKS", "MATNR", "BUDAT", "MBLNR"]).reset_index(drop=True)
     return materials, matdoc_df
+
+
+def append_storno_rows(rng: np.random.Generator, matdoc_df: pd.DataFrame, last_material_doc_number: int) -> pd.DataFrame:
+    if matdoc_df.empty:
+        return matdoc_df
+
+    eligible = matdoc_df[
+        matdoc_df["SJAHR"].astype(str).str.strip().eq("")
+        & matdoc_df["SMBLN"].astype(str).str.strip().eq("")
+        & matdoc_df["SMBLP"].astype(str).str.strip().eq("")
+    ].copy()
+    if eligible.empty:
+        return matdoc_df
+
+    storno_count = max(1, int(round(len(eligible) * 0.02)))
+    storno_count = min(storno_count, len(eligible))
+    selected_indices = rng.choice(eligible.index.to_numpy(), size=storno_count, replace=False)
+
+    storno_rows: list[dict[str, object]] = []
+    next_doc_number = last_material_doc_number
+    for idx in selected_indices:
+        original = matdoc_df.loc[idx]
+        next_doc_number += 1
+        original_date = pd.Timestamp(original["BUDAT"])
+        reversal_date = original_date + pd.Timedelta(days=int(rng.integers(1, 15)))
+        if reversal_date.date() > datetime.utcnow().date():
+            reversal_date = pd.Timestamp(datetime.utcnow().date())
+
+        storno_rows.append(
+            {
+                "MATNR": original["MATNR"],
+                "WERKS": original["WERKS"],
+                "BWART": original["BWART"],
+                "SHKZG": "H" if str(original["SHKZG"]).upper() == "S" else "S",
+                "MENGE": original["MENGE"],
+                "BUDAT": reversal_date,
+                "MJAHR": str(reversal_date.year),
+                "MBLNR": str(next_doc_number),
+                "ZEILE": "0001",
+                "SJAHR": str(original["MJAHR"]),
+                "SMBLN": str(original["MBLNR"]),
+                "SMBLP": str(original["ZEILE"]),
+            }
+        )
+
+    if not storno_rows:
+        return matdoc_df
+    return pd.concat([matdoc_df, pd.DataFrame(storno_rows)], ignore_index=True)
 
 
 def apply_special_safety_stock_rules(rng: np.random.Generator, materials: list[MaterialRecord]) -> None:
