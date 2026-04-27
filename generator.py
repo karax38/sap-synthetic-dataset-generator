@@ -24,8 +24,17 @@ ABC_DISTRIBUTION = [("A", 0.20), ("B", 0.30), ("C", 0.50)]
 PRICE_CONTROL_DISTRIBUTION = [("S", 0.70), ("V", 0.30)]
 SERVICE_LEVELS = {"A": 0.98, "B": 0.95, "C": 0.90}
 Z_VALUES = {"A": 2.05, "B": 1.65, "C": 1.28}
-MOVEMENT_TYPES = np.array([201, 261, 281, 601, 641, 643, 645])
 MOVEMENT_SIGNS = np.array(["S", "H"])
+EISBE_PROFILE_DISTRIBUTION = [
+    ("over", 0.72),
+    ("near", 0.08),
+    ("under", 0.20),
+]
+EISBE_MULTIPLIER_RANGES = {
+    "over": (1.25, 2.40),
+    "near": (0.95, 1.10),
+    "under": (0.35, 0.85),
+}
 UOM_CONFIG = {
     "ST": {"decan": 0},
     "PC": {"decan": 0},
@@ -114,12 +123,16 @@ class MaterialRecord:
     purchasing_processing_days: int
     wzeit_days: int | None
     safety_stock: float | None
+    reference_safety_stock: float
     price_control: str
     standard_price: float
     moving_average_price: float
     deletion_flag: str
     plant_deletion_flag: str
     base_monthly_demand: float
+
+
+MOVEMENT_TYPES = np.array([201, 261, 281, 601, 641, 643, 645])
 
 
 def build_rng() -> tuple[np.random.Generator, int]:
@@ -216,6 +229,49 @@ def calculate_safety_stock(demand_quantities: list[float], lead_time_days: int, 
     return round(float(max(0.0, safety_stock)), decan)
 
 
+def round_quantity(value: float, decan: int) -> float:
+    if decan == 0:
+        return float(max(0, int(math.ceil(value))))
+    return round(float(max(0.0, value)), decan)
+
+
+def compute_reference_safety_stock(
+    rng: np.random.Generator,
+    demand_quantities: list[float],
+    lead_time_days: int,
+    goods_receipt_days: int,
+    purchasing_processing_days: int,
+    abc_class: str,
+    decan: int,
+) -> float:
+    if not demand_quantities:
+        return 0.0
+
+    weekly_series = np.asarray(demand_quantities, dtype=float)
+    service_level = SERVICE_LEVELS[abc_class]
+    wzeit_days = lead_time_days + (5.0 / 7.0) * (purchasing_processing_days + goods_receipt_days)
+    wzeit_weeks = max(float(wzeit_days / 7.0), 0.05)
+    int_weeks = int(math.floor(wzeit_weeks))
+    frac = max(0.0, wzeit_weeks - int_weeks)
+    n_sim = 3000
+
+    if int_weeks > 0:
+        sampled = weekly_series[rng.integers(0, len(weekly_series), size=(n_sim, int_weeks))]
+        base_sum = sampled.sum(axis=1)
+    else:
+        base_sum = np.zeros(n_sim, dtype=float)
+
+    if frac > 0:
+        extra_pick = weekly_series[rng.integers(0, len(weekly_series), size=n_sim)]
+        extra_mask = (rng.random(n_sim) < frac).astype(float)
+        total = base_sum + (extra_pick * extra_mask)
+    else:
+        total = base_sum
+
+    safety_stock = float(np.quantile(total, service_level))
+    return round_quantity(safety_stock, decan)
+
+
 def build_materials(rng: np.random.Generator, plants: list[str], materials_per_plant: int, start_date: date, end_date: date) -> tuple[list[MaterialRecord], pd.DataFrame]:
     materials: list[MaterialRecord] = []
     matdoc_rows: list[dict[str, object]] = []
@@ -266,7 +322,15 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
                 if shkzg == "S":
                     issued_quantities.append(float(quantity))
 
-            safety_stock = calculate_safety_stock(issued_quantities, lead_time_days, abc_class, decan)
+            reference_safety_stock = compute_reference_safety_stock(
+                rng,
+                issued_quantities,
+                lead_time_days,
+                goods_receipt_days,
+                purchasing_processing_days,
+                abc_class,
+                decan,
+            )
             wzeit_days = None
             if rng.random() < 0.30:
                 wzeit_days = int(round(lead_time_days + (5.0 / 7.0) * (purchasing_processing_days + goods_receipt_days)))
@@ -282,7 +346,8 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
                     goods_receipt_days=goods_receipt_days,
                     purchasing_processing_days=purchasing_processing_days,
                     wzeit_days=wzeit_days,
-                    safety_stock=safety_stock,
+                    safety_stock=reference_safety_stock,
+                    reference_safety_stock=reference_safety_stock,
                     price_control=price_control,
                     standard_price=standard_price,
                     moving_average_price=moving_average_price,
@@ -292,13 +357,13 @@ def build_materials(rng: np.random.Generator, plants: list[str], materials_per_p
                 )
             )
 
-    apply_special_safety_stock_rules(rng, materials)
     matdoc_df = pd.DataFrame(matdoc_rows)
     if matdoc_df.empty:
         matdoc_df = pd.DataFrame(columns=[tech for _, tech in TEMPLATE_STRUCTURE["MATDOC"]])
     else:
         matdoc_df = append_storno_rows(rng, matdoc_df, material_doc_number)
         matdoc_df = matdoc_df.sort_values(["WERKS", "MATNR", "BUDAT", "MBLNR"]).reset_index(drop=True)
+    apply_special_safety_stock_rules(rng, materials, matdoc_df)
     return materials, matdoc_df
 
 
@@ -350,30 +415,79 @@ def append_storno_rows(rng: np.random.Generator, matdoc_df: pd.DataFrame, last_m
     return pd.concat([matdoc_df, pd.DataFrame(storno_rows)], ignore_index=True)
 
 
-def apply_special_safety_stock_rules(rng: np.random.Generator, materials: list[MaterialRecord]) -> None:
+def effective_issue_quantities(matdoc_df: pd.DataFrame, matnr: str, werks: str) -> list[float]:
+    subset = matdoc_df[
+        matdoc_df["MATNR"].astype(str).eq(matnr)
+        & matdoc_df["WERKS"].astype(str).eq(werks)
+    ].copy()
+    if subset.empty:
+        return []
+
+    storno_mask = subset["SMBLN"].astype(str).str.strip().ne("")
+    storno_refs = set(
+        zip(
+            subset.loc[storno_mask, "SJAHR"].astype(str),
+            subset.loc[storno_mask, "SMBLN"].astype(str),
+            subset.loc[storno_mask, "SMBLP"].astype(str),
+        )
+    )
+    original_keys = list(
+        zip(
+            subset["MJAHR"].astype(str),
+            subset["MBLNR"].astype(str),
+            subset["ZEILE"].astype(str),
+        )
+    )
+    reversed_original_mask = pd.Series([key in storno_refs for key in original_keys], index=subset.index)
+    active = subset.loc[~storno_mask & ~reversed_original_mask].copy()
+    issues = active.loc[active["SHKZG"].astype(str).str.upper().eq("S"), "MENGE"]
+    return [float(value) for value in pd.to_numeric(issues, errors="coerce").dropna().tolist()]
+
+
+def apply_special_safety_stock_rules(rng: np.random.Generator, materials: list[MaterialRecord], matdoc_df: pd.DataFrame) -> None:
     total = len(materials)
     if total == 0:
         return
 
     null_count = max(1, int(round(total * 0.10)))
-    high_count = max(1, int(round(total * 0.15)))
     indices = np.arange(total)
     rng.shuffle(indices)
     null_indices = set(indices[:null_count].tolist())
-    high_indices = set(indices[null_count:null_count + high_count].tolist())
 
     for idx, material in enumerate(materials):
         if idx in null_indices:
             materials[idx] = MaterialRecord(**{**material.__dict__, "safety_stock": None})
-        elif idx in high_indices and material.safety_stock is not None:
-            multiplier = float(rng.uniform(2.0, 4.0))
-            bumped = material.safety_stock * multiplier
-            decan = UOM_CONFIG[material.meins]["decan"]
-            if decan == 0:
-                bumped = float(int(math.ceil(bumped)))
-            else:
-                bumped = round(float(bumped), decan)
-            materials[idx] = MaterialRecord(**{**material.__dict__, "safety_stock": bumped})
+            continue
+
+        profile = weighted_choice(rng, EISBE_PROFILE_DISTRIBUTION)
+        low, high = EISBE_MULTIPLIER_RANGES[profile]
+        multiplier = float(rng.uniform(low, high))
+        decan = UOM_CONFIG[material.meins]["decan"]
+        issue_quantities = effective_issue_quantities(matdoc_df, material.matnr, material.werks)
+        baseline = compute_reference_safety_stock(
+            rng,
+            issue_quantities,
+            material.lead_time_days,
+            material.goods_receipt_days,
+            material.purchasing_processing_days,
+            material.abc_class,
+            decan,
+        )
+        if baseline <= 0:
+            baseline = float(material.reference_safety_stock)
+
+        if material.demand_pattern == "zero":
+            baseline = max(baseline, 0.0)
+        elif baseline <= 0:
+            baseline = calculate_safety_stock(
+                [max(material.base_monthly_demand / 4.0, 1.0)],
+                material.lead_time_days,
+                material.abc_class,
+                decan,
+            )
+
+        adjusted = round_quantity(max(baseline * multiplier, 0.0), decan)
+        materials[idx] = MaterialRecord(**{**material.__dict__, "safety_stock": adjusted})
 
 
 def build_tables(rng: np.random.Generator, materials: list[MaterialRecord], plants: list[str], matdoc: pd.DataFrame) -> dict[str, pd.DataFrame]:
